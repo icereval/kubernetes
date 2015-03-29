@@ -1,17 +1,25 @@
 #cloud-config
 
 write_files:
-  - path: /opt/bin/kube-net-update.sh
+  # - path: /opt/bin/kube-net-update.sh
+  #   permissions: 0755
+  #   content: |
+  #     #!/bin/sh
+  #     set -x -e
+  #     nh=${ETCD_WATCH_KEY##*/}
+  #     net=$ETCD_WATCH_VALUE
+  #     case $ETCD_WATCH_ACTION in
+  #     set) ip route replace $net via $nh dev eth2 metric 900 ;;
+  #     expire) ip route del $net via $nh metric 900 ;;
+  #     esac
+  - path: /opt/bin/regen-apiserver-list.sh
     permissions: 0755
     content: |
       #!/bin/sh
-      set -x -e
-      nh=${ETCD_WATCH_KEY##*/}
-      net=$ETCD_WATCH_VALUE
-      case $ETCD_WATCH_ACTION in
-      set) ip route replace $net via $nh dev eth2 metric 900 ;;
-      expire) ip route del $net via $nh metric 900 ;;
-      esac
+      m=$(echo $(etcdctl ls --recursive /corekube/apiservers | cut -d/ -f4 | sort) | tr ' ' ,)
+      mkdir -p /run/kubelet
+      echo "APISERVER_IPS=$m" > /run/kubelet/apiservers.env
+      echo "FIRST_APISERVER_URL=http://${m%%\,*}:7080" >> /run/kubelet/apiservers.env
   - path: /opt/bin/download-release.sh
     permissions: 0755
     content: |
@@ -33,27 +41,42 @@ write_files:
           -e '/^COREOS_PRIVATE_IPV4=/d' \
           "${ENV}"
 
+      # We spin loop until the the IP addresses are set
       function get_ip () {
-          echo $(ifconfig $1 | awk '/inet / {print $2}')
+          IF=$1
+          IP=
+          while [ 1 ]; do
+              IP=$(ifconfig $IF | awk '/inet / {print $2}')
+              if [ "$IP" != "" ]; then
+                  break
+              fi
+              sleep .1
+          done
+          echo $IP
       }
 
-      echo COREOS_PUBLIC_IPV4=$(get_ip eth0) >> $ENV
-      echo COREOS_PRIVATE_IPV4=$(get_ip eth2) >> $ENV
+      COREOS_PUBLIC_IPV4=$(get_ip eth0)
+      COREOS_PRIVATE_IPV4=$(get_ip eth2)
+
+      echo COREOS_PUBLIC_IPV4=$COREOS_PUBLIC_IPV4 >> $ENV
+      echo COREOS_PRIVATE_IPV4=$COREOS_PRIVATE_IPV4 >> $ENV
+
+      echo ETCD_ADDR=$COREOS_PRIVATE_IPV4:4001 >> $ENV
+      echo ETCD_PEER_ADDR=$COREOS_PRIVATE_IPV4:7001 >> $ENV
+      echo ETCD_PEER_BIND_ADDR=$COREOS_PRIVATE_IPV4:7001 >> $ENV
+
+      echo FLEET_PUBLIC_IP=$COREOS_PRIVATE_IPV4 >> $ENV
 
 coreos:
   etcd:
     name: kubernetes-minion-INDEX
     discovery: https://discovery.etcd.io/DISCOVERY_ID
-    addr: $private_ipv4:4001
-    peer-addr: $private_ipv4:7001
-    peer-bind-addr: $private_ipv4:7001
 
   flannel:
     interface: eth2
     ip_masq: yes
 
   fleet:
-    public-ip: $private_ipv4
     metadata: kubernetes_role=minion
 
   update:
@@ -75,10 +98,20 @@ coreos:
         ExecStart=/opt/bin/rackspace-setup-environment.sh
     - name: etcd.service
       command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Service]
+            EnvironmentFile=/etc/environment
     - name: flanneld.service
       command: start
     - name: fleet.service
       command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Service]
+            EnvironmentFile=/etc/environment
     - name: download-release.service
       command: start
       content: |
@@ -103,8 +136,10 @@ coreos:
         After=download-release.service
         Requires=download-release.service
         [Service]
+        EnvironmentFile=/etc/environment
+        EnvironmentFile=/run/kubelet/apiservers.env
         ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kubelet /opt/bin/kubelet
-        ExecStart=/opt/bin/kubelet --address=$private_ipv4 --hostname_override=$private_ipv4 --etcd_servers=http://127.0.0.1:4001 --logtostderr=true --config=/opt/kubernetes-manifests --cluster_dns=DNS_SERVER_IP --cluster_domain=DNS_DOMAIN
+        ExecStart=/opt/bin/kubelet --address=${COREOS_PRIVATE_IPV4} --hostname_override=${COREOS_PRIVATE_IPV4} --api_servers=$FIRST_APISERVER_URL --logtostderr=true --config=/opt/kubernetes-manifests --cluster_dns=DNS_SERVER_IP --cluster_domain=DNS_DOMAIN
         Restart=always
         RestartSec=2
     - name: minion-proxy.service
@@ -120,10 +155,32 @@ coreos:
         After=download-release.service
         Requires=download-release.service
         [Service]
+        EnvironmentFile=/etc/environment
+        EnvironmentFile=/run/kubelet/apiservers.env
         ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kube-proxy /opt/bin/kube-proxy
-        ExecStart=/opt/bin/kube-proxy --bind_address=$private_ipv4 --etcd_servers=http://127.0.0.1:4001 --logtostderr=true --v=2
+        ExecStart=/opt/bin/kube-proxy --bind_address=${COREOS_PRIVATE_IPV4} --master=$FIRST_APISERVER_URL --logtostderr=true
         Restart=always
         RestartSec=2
+    - name: kubelet-sighup.path
+      command: start
+      content: |
+        [Path]
+        PathChanged=/run/kubelet/apiservers.env
+    - name: kubelet-sighup.service
+      command: start
+      content: |
+        [Service]
+        ExecStart=/usr/bin/pkill -SIGHUP -f kubelet
+    - name: kube-proxy-sighup.path
+      command: start
+      content: |
+        [Path]
+        PathChanged=/run/kubelet/apiservers.env
+    - name: kube-proxy-sighup.service
+      command: start
+      content: |
+        [Service]
+        ExecStart=/usr/bin/pkill -SIGHUP -f kube-proxy
     - name: minion-advertiser.service
       command: start
       content: |
@@ -133,93 +190,108 @@ coreos:
         Requires=etcd.service
         After=minion-kubelet.service
         [Service]
-        ExecStart=/bin/sh -c 'while :; do etcdctl set /corekube/minions/$private_ipv4 $private_ipv4 --ttl 300; sleep 120; done'
+        EnvironmentFile=/etc/environment
+        ExecStart=/bin/sh -c 'while :; do etcdctl set /corekube/minions/${COREOS_PRIVATE_IPV4} ${COREOS_PRIVATE_IPV4} --ttl 300; sleep 120; done'
         Restart=always
         RestartSec=120
-    - name: net-advertiser.service
+    - name: apiserver-finder.service
       command: start
       content: |
         [Unit]
-        Description=Kubernetes Network Advertiser
+        Description=Kubernetes Apiserver finder
+        After=network-online.target
+        Requires=network-online.target
         After=etcd.service
         Requires=etcd.service
-        After=minion-kubelet.service
         [Service]
-        ExecStart=/bin/sh -c 'eth2_ip=$$(ip -o -f inet a show dev eth2 | sed "s/.* inet \([0-9.]\+\).*/\1/"); while :; do etcdctl set /corekube/net/$$eth2_ip 10.240.INDEX.0/24 --ttl 300; sleep 120; done'
-        Restart=always
-        RestartSec=120
-    - name: net-router.service
-      command: start
-      content: |
-        [Unit]
-        Description=Kubernetes Network Router
-        After=etcd.service
-        Requires=etcd.service
-        After=minion-kubelet.service
-        [Service]
-        ExecStart=/usr/bin/etcdctl exec-watch --recursive /corekube/net -- /opt/bin/kube-net-update.sh
-        Restart=always
-        RestartSec=120
-    - name: cbr0.netdev
-      command: start
-      content: |
-        [NetDev]
-        Kind=bridge
-        Name=cbr0
-    - name: cbr0.network
-      command: start
-      content: |
-        [Match]
-        Name=cbr0
-
-        [Network]
-        Address=10.240.INDEX.1/24
-    - name: nat.service
-      command: start
-      content: |
-        [Unit]
-        Description=NAT container->outside traffic
-
-        [Service]
-        ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o eth0 -s 10.240.INDEX.0/24 -j MASQUERADE
-        ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o eth1 -s 10.240.INDEX.0/24 -j MASQUERADE
-        RemainAfterExit=yes
-        Type=oneshot
-    - name: docker.service
-      command: start
-      content: |
-        [Unit]
-        After=network.target
-        Description=Docker Application Container Engine
-        Documentation=http://docs.docker.io
-
-        [Service]
-        ExecStartPre=/bin/mount --make-rprivate /
-        ExecStart=/usr/bin/docker -d -H fd:// -b cbr0 --iptables=false
+        ExecStartPre=/opt/bin/regen-apiserver-list.sh
+        ExecStart=/usr/bin/etcdctl exec-watch --recursive /corekube/apiservers -- /opt/bin/regen-apiserver-list.sh
         Restart=always
         RestartSec=30
-
-        [Install]
-        WantedBy=multi-user.target
-    - name: format-data.service
-      command: start
-      content: |
-        [Unit]
-        Description=Formats data drive
-        [Service]
-        Type=oneshot
-        RemainAfterExit=yes
-        ExecStart=/usr/sbin/wipefs -f /dev/xvde1
-        ExecStart=/usr/sbin/mkfs.btrfs -f /dev/xvde1
-    - name: var-lib-docker-volumes.mount
-      command: start
-      content: |
-        [Unit]
-        Description=Mount data drive to /var/lib/docker/volumes
-        Requires=format-data.service
-        After=format-data.service
-        Before=docker.service
-        [Mount]
-        What=/dev/xvde1
-        Where=/var/lib/docker/volumes
-        Type=btrfs
+    # - name: net-advertiser.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Kubernetes Network Advertiser
+    #     After=etcd.service
+    #     Requires=etcd.service
+    #     After=minion-kubelet.service
+    #     [Service]
+    #     ExecStart=/bin/sh -c 'eth2_ip=$$(ip -o -f inet a show dev eth2 | sed "s/.* inet \([0-9.]\+\).*/\1/"); while :; do etcdctl set /corekube/net/$$eth2_ip 10.240.INDEX.0/24 --ttl 300; sleep 120; done'
+    #     Restart=always
+    #     RestartSec=120
+    # - name: net-router.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Kubernetes Network Router
+    #     After=etcd.service
+    #     Requires=etcd.service
+    #     After=minion-kubelet.service
+    #     [Service]
+    #     ExecStart=/usr/bin/etcdctl exec-watch --recursive /corekube/net -- /opt/bin/kube-net-update.sh
+    #     Restart=always
+    #     RestartSec=120
+    # - name: cbr0.netdev
+    #   command: start
+    #   content: |
+    #     [NetDev]
+    #     Kind=bridge
+    #     Name=cbr0
+    # - name: cbr0.network
+    #   command: start
+    #   content: |
+    #     [Match]
+    #     Name=cbr0
+    #
+    #     [Network]
+    #     Address=10.240.INDEX.1/24
+    # - name: nat.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=NAT container->outside traffic
+    #
+    #     [Service]
+    #     ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o eth0 -s 10.240.INDEX.0/24 -j MASQUERADE
+    #     ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o eth1 -s 10.240.INDEX.0/24 -j MASQUERADE
+    #     RemainAfterExit=yes
+    #     Type=oneshot
+    # - name: docker.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     After=network.target
+    #     Description=Docker Application Container Engine
+    #     Documentation=http://docs.docker.io
+    #
+    #     [Service]
+    #     ExecStartPre=/bin/mount --make-rprivate /
+    #     ExecStart=/usr/bin/docker -d -H fd:// -b cbr0 --iptables=false
+    #     Restart=always
+    #     RestartSec=30
+    #
+    #     [Install]
+    #     WantedBy=multi-user.target
+    # - name: format-data.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Formats data drive
+    #     [Service]
+    #     Type=oneshot
+    #     RemainAfterExit=yes
+    #     ExecStart=/usr/sbin/wipefs -f /dev/xvde1
+    #     ExecStart=/usr/sbin/mkfs.btrfs -f /dev/xvde1
+    # - name: var-lib-docker-volumes.mount
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Mount data drive to /var/lib/docker/volumes
+    #     Requires=format-data.service
+    #     After=format-data.service
+    #     Before=docker.service
+    #     [Mount]
+    #     What=/dev/xvde1
+    #     Where=/var/lib/docker/volumes
+    #     Type=btrfs

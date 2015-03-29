@@ -44,27 +44,42 @@ write_files:
           -e '/^COREOS_PRIVATE_IPV4=/d' \
           "${ENV}"
 
+      # We spin loop until the the IP addresses are set
       function get_ip () {
-          echo $(ifconfig $1 | awk '/inet / {print $2}')
+          IF=$1
+          IP=
+          while [ 1 ]; do
+              IP=$(ifconfig $IF | awk '/inet / {print $2}')
+              if [ "$IP" != "" ]; then
+                  break
+              fi
+              sleep .1
+          done
+          echo $IP
       }
 
-      echo COREOS_PUBLIC_IPV4=$(get_ip eth0) >> $ENV
-      echo COREOS_PRIVATE_IPV4=$(get_ip eth2) >> $ENV
+      COREOS_PUBLIC_IPV4=$(get_ip eth0)
+      COREOS_PRIVATE_IPV4=$(get_ip eth2)
+
+      echo COREOS_PUBLIC_IPV4=$COREOS_PUBLIC_IPV4 >> $ENV
+      echo COREOS_PRIVATE_IPV4=$COREOS_PRIVATE_IPV4 >> $ENV
+
+      echo ETCD_ADDR=$COREOS_PRIVATE_IPV4:4001 >> $ENV
+      echo ETCD_PEER_ADDR=$COREOS_PRIVATE_IPV4:7001 >> $ENV
+      echo ETCD_PEER_BIND_ADDR=$COREOS_PRIVATE_IPV4:7001 >> $ENV
+
+      echo FLEET_PUBLIC_IP=$COREOS_PRIVATE_IPV4 >> $ENV
 
 coreos:
   etcd:
     name: kubernetes-master
     discovery: https://discovery.etcd.io/DISCOVERY_ID
-    addr: $private_ipv4:4001
-    peer-addr: $private_ipv4:7001
-    peer-bind-addr: $private_ipv4:7001
 
   flannel:
     interface: eth2
     ip_masq: yes
 
   fleet:
-    public-ip: $private_ipv4
     metadata: kubernetes_role=master
 
   update:
@@ -86,6 +101,11 @@ coreos:
         ExecStart=/opt/bin/rackspace-setup-environment.sh
     - name: etcd.service
       command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Service]
+            EnvironmentFile=/etc/environment
     - name: flanneld.service
       command: start
       drop-ins:
@@ -95,6 +115,11 @@ coreos:
             ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.244.0.0/16", "Backend": {"Type": "vxlan"}}'
     - name: fleet.service
       command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Service]
+            EnvironmentFile=/etc/environment
     - name: download-release.service
       command: start
       content: |
@@ -117,10 +142,24 @@ coreos:
         After=download-release.service
         Requires=download-release.service
         [Service]
+        EnvironmentFile=/etc/environment
         ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kube-apiserver /opt/bin/kube-apiserver
-        ExecStart=/opt/bin/kube-apiserver --address=127.0.0.1 --port=8080 --etcd_servers=http://127.0.0.1:4001 --portal_net=PORTAL_NET --logtostderr=true --cloud_provider=rackspace --cloud_config=/etc/cloud.conf --v=2
+        ExecStart=/opt/bin/kube-apiserver --address=127.0.0.1 --port=8080 --etcd_servers=http://127.0.0.1:4001 --portal_net=PORTAL_NET --logtostderr=true --cloud_provider=rackspace --cloud_config=/etc/cloud.conf --v=2 --public_address_override=${COREOS_PRIVATE_IPV4}
         Restart=always
         RestartSec=2
+    - name: apiserver-advertiser.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Apiserver Advertiser
+        After=etcd.service
+        Requires=etcd.service
+        After=master-apiserver.service
+        [Service]
+        EnvironmentFile=/etc/environment
+        ExecStart=/bin/sh -c 'etcdctl set /corekube/apiservers/${COREOS_PRIVATE_IPV4} ${COREOS_PRIVATE_IPV4}'
+        Restart=always
+        RestartSec=120
     - name: master-controller-manager.service
       command: start
       content: |
