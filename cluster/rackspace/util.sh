@@ -215,9 +215,9 @@ ${MINION_NAMES[$i]}"
 }
 
 rax-nova-network() {
-  if ! $(nova network-list | grep $NOVA_NETWORK_LABEL > /dev/null 2>&1); then
+  if ! $(nova network-list | grep "$NOVA_NETWORK_LABEL" > /dev/null 2>&1); then
     SAFE_CIDR=$(echo $NOVA_NETWORK_CIDR | tr -d '\\')
-    NETWORK_CREATE_CMD="nova network-create $NOVA_NETWORK_LABEL $SAFE_CIDR"
+    NETWORK_CREATE_CMD="nova network-create "$NOVA_NETWORK_LABEL" $SAFE_CIDR"
 
     echo "cluster/rackspace/util.sh: Creating cloud network with following command:"
     echo -e "\t${NETWORK_CREATE_CMD}"
@@ -291,7 +291,7 @@ kube-up() {
   HTPASSWD=$(cat ${KUBE_TEMP}/htpasswd)
 
   rax-nova-network
-  NETWORK_UUID=$(nova network-list | grep -i ${NOVA_NETWORK_LABEL} | awk '{print $2}')
+  NETWORK_UUID=$(nova network-list | grep -i "${NOVA_NETWORK_LABEL}" | awk '{print $2}')
 
   # create and upload ssh key if necessary
   rax-ssh-key
@@ -312,6 +312,8 @@ kube-up() {
   fi
 
   detect-master
+
+
 
   echo "Waiting for cluster initialization."
   echo
