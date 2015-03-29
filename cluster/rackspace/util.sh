@@ -139,7 +139,7 @@ copy_dev_tarballs() {
   echo "cluster/rackspace/util.sh: Uploading to Cloud Files"
   ${SWIFTLY_CMD} put -i ${RELEASE_DIR}/kubernetes-server-linux-amd64.tar.gz \
   ${CLOUDFILES_CONTAINER}/${CONTAINER_PREFIX}/kubernetes-server-linux-amd64.tar.gz > /dev/null 2>&1
-  
+
   echo "Release pushed."
 }
 
@@ -217,7 +217,7 @@ ${MINION_NAMES[$i]}"
 rax-nova-network() {
   if ! $(nova network-list | grep "$NOVA_NETWORK_LABEL" > /dev/null 2>&1); then
     SAFE_CIDR=$(echo $NOVA_NETWORK_CIDR | tr -d '\\')
-    NETWORK_CREATE_CMD="nova network-create "$NOVA_NETWORK_LABEL" $SAFE_CIDR"
+    NETWORK_CREATE_CMD="nova network-create \"$NOVA_NETWORK_LABEL\" $SAFE_CIDR"
 
     echo "cluster/rackspace/util.sh: Creating cloud network with following command:"
     echo -e "\t${NETWORK_CREATE_CMD}"
