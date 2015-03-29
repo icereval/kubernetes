@@ -22,6 +22,23 @@ write_files:
       echo "Unpacking release"
       rm -rf /opt/kubernetes || false
       tar xzf /opt/kubernetes.tar.gz -C /opt/
+  - path: /opt/bin/rackspace-setup-environment.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+
+      ENV="/etc/environment"
+
+      sed -i -e '/^COREOS_PUBLIC_IPV4=/d' \
+          -e '/^COREOS_PRIVATE_IPV4=/d' \
+          "${ENV}"
+
+      function get_ip () {
+          echo $(ifconfig $1 | awk '/inet / {print $2}')
+      }
+
+      echo COREOS_PUBLIC_IPV4=$(get_ip eth0) >> $ENV
+      echo COREOS_PRIVATE_IPV4=$(get_ip eth2) >> $ENV
 
 coreos:
   etcd:
@@ -39,6 +56,19 @@ coreos:
     reboot-strategy: etcd-lock
 
   units:
+    - name: rackspace-setup-environment.service
+      runtime: true
+      command: start
+      content: |
+        [Unit]
+        Description=Setup environment with private (and public) IP addresses
+        Wants=coreos-setup-environment.service
+        After=coreos-setup-environment.service
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        ExecStart=/opt/bin/rackspace-setup-environment.sh
     - name: etcd.service
       command: start
     - name: fleet.service
