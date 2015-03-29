@@ -48,6 +48,10 @@ coreos:
     peer-addr: $private_ipv4:7001
     peer-bind-addr: $private_ipv4:7001
 
+  flannel:
+    interface: eth2
+    ip_masq: yes
+
   fleet:
     public-ip: $private_ipv4
     metadata: kubernetes_role=minion
@@ -70,6 +74,8 @@ coreos:
         RemainAfterExit=yes
         ExecStart=/opt/bin/rackspace-setup-environment.sh
     - name: etcd.service
+      command: start
+    - name: flanneld.service
       command: start
     - name: fleet.service
       command: start
