@@ -1,36 +1,17 @@
 #cloud-config
 
 write_files:
-  # - path: /opt/bin/kube-net-update.sh
-  #   permissions: 0755
-  #   content: |
-  #     #!/bin/sh
-  #     set -x -e
-  #     nh=${ETCD_WATCH_KEY##*/}
-  #     net=$ETCD_WATCH_VALUE
-  #     case $ETCD_WATCH_ACTION in
-  #     set) ip route replace $net via $nh dev eth2 metric 900 ;;
-  #     expire) ip route del $net via $nh metric 900 ;;
-  #     esac
-  - path: /opt/bin/regen-apiserver-list.sh
-    permissions: 0755
+  - path: /opt/kubernetes/.kubernetes_auth
+    permissions: 0600
     content: |
-      #!/bin/sh
-      m=$(echo $(etcdctl ls --recursive /corekube/apiservers | cut -d/ -f4 | sort) | tr ' ' ,)
-      mkdir -p /run/kubelet
-      echo "APISERVER_IPS=$m" > /run/kubelet/apiservers.env
-      echo "FIRST_APISERVER_URL=http://${m%%\,*}:7080" >> /run/kubelet/apiservers.env
-  - path: /opt/bin/download-release.sh
-    permissions: 0755
-    content: |
-      #!/bin/bash
-      OBJECT_URL="CLOUD_FILES_URL"
-      echo "Downloading release ($OBJECT_URL)"
-      wget "${OBJECT_URL}" -O /opt/kubernetes.tar.gz
-      echo "Unpacking release"
-      rm -rf /opt/kubernetes || false
-      tar xzf /opt/kubernetes.tar.gz -C /opt/
-  - path: /opt/bin/rackspace-setup-environment.sh
+      {
+        "User": "KUBE_USER",
+        "Password": "KUBE_PASSWORD",
+        "CAFile": "/etc/ssl/kubernetes/ca.crt",
+        "CertFile": "/etc/ssl/kubernetes/client.crt",
+        "KeyFile": "/etc/ssl/kubernetes/private/client.key"
+      }
+  - path: /run/rackspace-setup-environment.sh
     permissions: '0755'
     content: |
       #!/bin/bash
@@ -61,27 +42,54 @@ write_files:
       echo COREOS_PUBLIC_IPV4=$COREOS_PUBLIC_IPV4 >> $ENV
       echo COREOS_PRIVATE_IPV4=$COREOS_PRIVATE_IPV4 >> $ENV
 
-      echo ETCD_ADDR=$COREOS_PRIVATE_IPV4:4001 >> $ENV
-      echo ETCD_PEER_ADDR=$COREOS_PRIVATE_IPV4:7001 >> $ENV
-      echo ETCD_PEER_BIND_ADDR=$COREOS_PRIVATE_IPV4:7001 >> $ENV
-
+      # systemd does not perform environment variable expansion, thus no drop-ins.
+      # http://www.freedesktop.org/software/systemd/man/systemd.exec.html#Environment=
+      echo ETCD_ADVERTISE_CLIENT_URLS=http://$COREOS_PRIVATE_IPV4:2379 >> $ENV
+      echo ETCD_INITIAL_ADVERTISE_PEER_URLS=http://$COREOS_PRIVATE_IPV4:2380 >> $ENV
+      echo ETCD_LISTEN_CLIENT_URLS=http://localhost:2379,http://$COREOS_PRIVATE_IPV4:2379 >> $ENV
+      echo ETCD_LISTEN_PEER_URLS=http://$COREOS_PRIVATE_IPV4:2380 >> $ENV
+      #
       echo FLEET_PUBLIC_IP=$COREOS_PRIVATE_IPV4 >> $ENV
-
+  - path: /etc/profile.d/basepath.sh
+    permissions: 0644
+    owner: core
+    content: |
+      export PATH="/opt/bin:$PATH"
+  - path: /etc/profile.d/etcdctl.sh
+    permissions: 0644
+    owner: core
+    content: |
+      export ETCDCTL_PEERS="http://127.0.0.1:2379"
+  - path: /etc/profile.d/fleetctl.sh
+    permissions: 0644
+    owner: core
+    content: |
+      export FLEETCTL_ENDPOINT=http://127.0.0.1:2379
+  # - path: /opt/kubernetes/bin/kube-apiserver-finder.sh
+  #   permissions: 0755
+  #   content: |
+  #     #!/bin/sh
+  #     m=$(echo $(etcdctl ls --recursive /corekube/apiservers | cut -d/ -f4 | sort) | tr ' ' ,)
+  #     mkdir -p /run/kubelet
+  #     echo "APISERVER_IPS=$m" > /run/kubelet/apiservers.env
+  #     echo "FIRST_APISERVER_URL=https://${m%%\,*}:6443" >> /run/kubelet/apiservers.env
 coreos:
   etcd:
-    name: kubernetes-minion-INDEX
     discovery: https://discovery.etcd.io/DISCOVERY_ID
-
+    ca_file: /etc/ssl/etcd/certs/ca.crt
+    cert_file: /etc/ssl/etcd/certs/server.crt
+    key_file: /etc/ssl/etcd/private/server.key
+    peer_ca_file: /etc/ssl/etcd/certs/ca.crt
+    peer_cert_file: /etc/ssl/etcd/certs/peer.crt
+    peer_key_file: /etc/ssl/etcd/private/peer.key
   flannel:
     interface: eth2
     ip_masq: yes
-
   fleet:
     metadata: kubernetes_role=minion
-
+    etcd_servers: http://127.0.0.1:2379
   update:
     reboot-strategy: etcd-lock
-
   units:
     - name: rackspace-setup-environment.service
       runtime: true
@@ -95,203 +103,142 @@ coreos:
         [Service]
         Type=oneshot
         RemainAfterExit=yes
-        ExecStart=/opt/bin/rackspace-setup-environment.sh
+        ExecStart=/run/rackspace-setup-environment.sh
     - name: etcd.service
       command: start
-      drop-ins:
-        - name: 50-network-config.conf
-          content: |
-            [Service]
-            EnvironmentFile=/etc/environment
-    - name: flanneld.service
-      command: start
+      content: |
+        [Unit]
+        Description=etcd 2.0
+        After=docker.service
+        ConditionPathIsDirectory=/etc/ssl/etcd/private
+
+        [Service]
+        EnvironmentFile=/etc/environment
+        Environment=ETCD_DATA_DIR=/var/lib/etcd
+        Environment=ETCD_NAME=%m
+        ExecStartPre=-/usr/bin/docker kill etcd
+        ExecStartPre=-/usr/bin/docker rm etcd
+        ExecStartPre=/usr/bin/docker pull quay.io/coreos/etcd:v2.0.5
+        ExecStart=/usr/bin/docker run \
+          --net host \
+          --name etcd \
+          -v /opt/etcd:/opt/etcd \
+          -v /usr/share/ca-certificates:/etc/ssl/certs \
+          -v /etc/ssl/etcd:/etc/ssl/etcd \
+          quay.io/coreos/etcd:v2.0.5 \
+          -data-dir ${ETCD_DATA} \
+          -name ${ETCD_NAME} \
+          -discovery ${ETCD_DISCOVERY} \
+          -ca-file ${ETCD_CA_FILE} \
+          -cert-file ${ETCD_CERT_FILE} \
+          -key-file ${ETCD_KEY_FILE} \
+          -peer-ca-file ${ETCD_PEER_CA_FILE} \
+          -peer-cert-file ${ETCD_PEER_CERT_FILE} \
+          -peer-key-file ${ETCD_PEER_KEY_FILE} \
+          -advertise-client-urls ${ETCD_ADVERTISE_CLIENT_URLS} \
+          -initial-advertise-peer-urls ${ETCD_INITIAL_ADVERTISE_PEER_URLS} \
+          -listen-client-urls ${ETCD_LISTEN_CLIENT_URLS} \
+          -listen-peer-urls ${ETCD_LISTEN_PEER_URLS}
+        ExecStop=/usr/bin/docker kill etcd
+        SyslogIdentifier=etcd
+        Restart=always
+        RestartSec=10s
+        LimitNOFILE=40000
     - name: fleet.service
       command: start
       drop-ins:
         - name: 50-network-config.conf
           content: |
+            [Unit]
+            Requires=etcd.service
+            After=etcd.service
+
             [Service]
             EnvironmentFile=/etc/environment
-    - name: download-release.service
+    - name: flanneld.service
+      command: start
+    - name: update-etcdctl.service
       command: start
       content: |
-        [Unit]
-        Description=Downloads Kubernetes Release
-        After=network-online.target
-        Requires=network-online.target
-        [Service]
-        Type=oneshot
-        RemainAfterExit=yes
-        ExecStart=/usr/bin/bash /opt/bin/download-release.sh
-    - name: minion-kubelet.service
-      command: start
-      content: |
-        [Unit]
-        Description=Kubernetes Kubelet
-        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
-        After=network-online.target
-        Requires=network-online.target
-        After=docker.service
-        Requires=docker.service
-        After=download-release.service
-        Requires=download-release.service
-        [Service]
-        EnvironmentFile=/etc/environment
-        EnvironmentFile=/run/kubelet/apiservers.env
-        ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kubelet /opt/bin/kubelet
-        ExecStart=/opt/bin/kubelet --address=${COREOS_PRIVATE_IPV4} --hostname_override=${COREOS_PRIVATE_IPV4} --api_servers=$FIRST_APISERVER_URL --logtostderr=true --config=/opt/kubernetes-manifests --cluster_dns=DNS_SERVER_IP --cluster_domain=DNS_DOMAIN
-        Restart=always
-        RestartSec=2
-    - name: minion-proxy.service
-      command: start
-      content: |
-        [Unit]
-        Description=Kubernetes Proxy
-        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
-        After=network-online.target
-        Requires=network-online.target
-        After=docker.service
-        Requires=docker.service
-        After=download-release.service
-        Requires=download-release.service
-        [Service]
-        EnvironmentFile=/etc/environment
-        EnvironmentFile=/run/kubelet/apiservers.env
-        ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/server/bin/kube-proxy /opt/bin/kube-proxy
-        ExecStart=/opt/bin/kube-proxy --bind_address=${COREOS_PRIVATE_IPV4} --master=$FIRST_APISERVER_URL --logtostderr=true
-        Restart=always
-        RestartSec=2
-    - name: kubelet-sighup.path
-      command: start
-      content: |
-        [Path]
-        PathChanged=/run/kubelet/apiservers.env
-    - name: kubelet-sighup.service
-      command: start
-      content: |
-        [Service]
-        ExecStart=/usr/bin/pkill -SIGHUP -f kubelet
-    - name: kube-proxy-sighup.path
-      command: start
-      content: |
-        [Path]
-        PathChanged=/run/kubelet/apiservers.env
-    - name: kube-proxy-sighup.service
-      command: start
-      content: |
-        [Service]
-        ExecStart=/usr/bin/pkill -SIGHUP -f kube-proxy
-    - name: minion-advertiser.service
-      command: start
-      content: |
-        [Unit]
-        Description=Kubernetes Minion Advertiser
-        After=etcd.service
-        Requires=etcd.service
-        After=minion-kubelet.service
-        [Service]
-        EnvironmentFile=/etc/environment
-        ExecStart=/bin/sh -c 'while :; do etcdctl set /corekube/minions/${COREOS_PRIVATE_IPV4} ${COREOS_PRIVATE_IPV4} --ttl 300; sleep 120; done'
-        Restart=always
-        RestartSec=120
-    - name: apiserver-finder.service
-      command: start
-      content: |
-        [Unit]
-        Description=Kubernetes Apiserver finder
-        After=network-online.target
-        Requires=network-online.target
-        After=etcd.service
-        Requires=etcd.service
-        [Service]
-        ExecStartPre=/opt/bin/regen-apiserver-list.sh
-        ExecStart=/usr/bin/etcdctl exec-watch --recursive /corekube/apiservers -- /opt/bin/regen-apiserver-list.sh
-        Restart=always
-        RestartSec=30
-    # - name: net-advertiser.service
+          [Unit]
+          Descritpion=updates etcdctl to v2.0
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/bin/curl -L https://github.com/coreos/etcd/releases/download/v2.0.5/etcd-v2.0.5-linux-amd64.tar.gz -o /tmp/etcd-v2.0.5-linux-amd64.tar.gz
+          ExecStart=/usr/bin/tar zxf /tmp/etcd-v2.0.5-linux-amd64.tar.gz -C /tmp
+          ExecStart=/usr/bin/mkdir -p /opt/bin
+          ExecStart=/usr/bin/cp /tmp/etcd-v2.0.5-linux-amd64/etcdctl /opt/bin
+    # - name: download-kubernetes.service
     #   command: start
     #   content: |
     #     [Unit]
-    #     Description=Kubernetes Network Advertiser
-    #     After=etcd.service
-    #     Requires=etcd.service
-    #     After=minion-kubelet.service
-    #     [Service]
-    #     ExecStart=/bin/sh -c 'eth2_ip=$$(ip -o -f inet a show dev eth2 | sed "s/.* inet \([0-9.]\+\).*/\1/"); while :; do etcdctl set /corekube/net/$$eth2_ip 10.240.INDEX.0/24 --ttl 300; sleep 120; done'
-    #     Restart=always
-    #     RestartSec=120
-    # - name: net-router.service
-    #   command: start
-    #   content: |
-    #     [Unit]
-    #     Description=Kubernetes Network Router
-    #     After=etcd.service
-    #     Requires=etcd.service
-    #     After=minion-kubelet.service
-    #     [Service]
-    #     ExecStart=/usr/bin/etcdctl exec-watch --recursive /corekube/net -- /opt/bin/kube-net-update.sh
-    #     Restart=always
-    #     RestartSec=120
-    # - name: cbr0.netdev
-    #   command: start
-    #   content: |
-    #     [NetDev]
-    #     Kind=bridge
-    #     Name=cbr0
-    # - name: cbr0.network
-    #   command: start
-    #   content: |
-    #     [Match]
-    #     Name=cbr0
-    #
-    #     [Network]
-    #     Address=10.240.INDEX.1/24
-    # - name: nat.service
-    #   command: start
-    #   content: |
-    #     [Unit]
-    #     Description=NAT container->outside traffic
+    #     Description=Downloads Kubernetes Release
+    #     After=network-online.target
+    #     Requires=network-online.target
     #
     #     [Service]
-    #     ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o eth0 -s 10.240.INDEX.0/24 -j MASQUERADE
-    #     ExecStart=/usr/sbin/iptables -t nat -A POSTROUTING -o eth1 -s 10.240.INDEX.0/24 -j MASQUERADE
-    #     RemainAfterExit=yes
     #     Type=oneshot
-    # - name: docker.service
+    #     RemainAfterExit=yes
+    #     ExecStartPre=/usr/bin/wget CLOUD_FILES_URL -O /tmp/kubernetes.tar.gz
+    #     ExecStartPre=/usr/bin/mkdir -p /opt/kubernetes
+    #     ExecStart=/usr/bin/tar xzf /tmp/kubernetes.tar.gz --strip 1 -C /opt/kubernetes/
+    # - name: kubelet.service
     #   command: start
     #   content: |
     #     [Unit]
-    #     After=network.target
-    #     Description=Docker Application Container Engine
-    #     Documentation=http://docs.docker.io
+    #     Description=Kubernetes Kubelet
+    #     Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    #     After=download-kubernetes.service
+    #     Requires=download-kubernetes.service
+    #     ConditionPathExists=/etc/ssl/kubernetes/
+    #     ConditionPathExists=/run/kubelet/apiservers.env
     #
     #     [Service]
-    #     ExecStartPre=/bin/mount --make-rprivate /
-    #     ExecStart=/usr/bin/docker -d -H fd:// -b cbr0 --iptables=false
+    #     EnvironmentFile=/etc/environment
+    #     EnvironmentFile=/run/kubelet/apiservers.env
+    #     ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/bin/kubelet /opt/kubernetes/bin/kubelet
+    #     ExecStart=/opt/kubernetes/bin/kubelet \
+    #       --address=${COREOS_PRIVATE_IPV4} \
+    #       --hostname_override=${COREOS_PRIVATE_IPV4} \
+    #       --api_servers=${FIRST_APISERVER_URL} \
+    #       --logtostderr=true \
+    #       --config=/opt/kubernetes/kubernetes-manifests \
+    #       --cluster_dns=DNS_SERVER_IP \
+    #       --cluster_domain=DNS_DOMAIN \
+    #       --auth_path=/opt/kubernetes/.kubernetes_auth
+    #     Restart=always
+    #     RestartSec=2
+    # - name: kube-proxy.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Kubernetes Proxy
+    #     Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+    #     After=download-kubernetes.service
+    #     Requires=download-kubernetes.service
+    #     ConditionPathExists=/run/kubelet/apiservers.env
+    #
+    #     [Service]
+    #     EnvironmentFile=/etc/environment
+    #     EnvironmentFile=/run/kubelet/apiservers.env
+    #     ExecStartPre=/usr/bin/ln -sf /opt/kubernetes/bin/kube-proxy /opt/kubernetes/bin/kube-proxy
+    #     ExecStart=/opt/kubernetes/bin/kube-proxy --bind_address=${COREOS_PRIVATE_IPV4} --master=${FIRST_APISERVER_URL} --logtostderr=true
+    #     Restart=always
+    #     RestartSec=2
+    # - name: kube-apiserver-finder.service
+    #   command: start
+    #   content: |
+    #     [Unit]
+    #     Description=Kubernetes Apiserver Finder
+    #     After=download-kubernetes.service
+    #     Requires=download-kubernetes.service
+    #     After=etcd.service
+    #     Requires=etcd.service
+    #
+    #     [Service]
+    #     ExecStartPre=/opt/kubernetes/bin/kube-apiserver-finder.sh
+    #     ExecStart=/usr/bin/etcdctl exec-watch --recursive /corekube/apiservers -- /opt/kubernetes/bin/kube-apiserver-finder.sh
     #     Restart=always
     #     RestartSec=30
-    #
-    #     [Install]
-    #     WantedBy=multi-user.target
-    # - name: format-data.service
-    #   command: start
-    #   content: |
-    #     [Unit]
-    #     Description=Formats data drive
-    #     [Service]
-    #     Type=oneshot
-    #     RemainAfterExit=yes
-    #     ExecStart=/usr/sbin/wipefs -f /dev/xvde1
-    #     ExecStart=/usr/sbin/mkfs.btrfs -f /dev/xvde1
-    # - name: var-lib-docker-volumes.mount
-    #   command: start
-    #   content: |
-    #     [Unit]
-    #     Description=Mount data drive to /var/lib/docker/volumes
-    #     Requires=format-data.service
-    #     After=format-data.service
-    #     Before=docker.service
-    #     [Mount]
-    #     What=/dev/xvde1
-    #     Where=/var/lib/docker/volumes
-    #     Type=btrfs
